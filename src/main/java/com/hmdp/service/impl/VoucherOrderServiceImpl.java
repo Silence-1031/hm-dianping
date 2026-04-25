@@ -19,6 +19,7 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.time.Duration;
 import java.util.Collections;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -49,6 +51,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+    private VoucherOrderHandler handler;
+    private volatile boolean running = true;
+
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
 
     static {
@@ -57,12 +63,38 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_SCRIPT.setResultType(Long.class);
     }
 
-
-    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
-
     @PostConstruct
-    private void init() {
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+    public void init() {
+        try {
+            // 1. 创建流 stream.orders（如果不存在）
+            stringRedisTemplate.opsForStream().createGroup(
+                    "stream.orders",
+                    ReadOffset.latest(),
+                    "g1"
+            );
+            log.info("Stream 消费组 g1 初始化成功");
+        } catch (Exception e) {
+            log.info("Stream 或消费组 g1 已存在，无需重复创建");
+        }
+
+        // 2. 启动后台线程
+        handler = new VoucherOrderHandler();
+        SECKILL_ORDER_EXECUTOR.submit(handler);
+        log.info("秒杀订单异步处理线程已启动");
+    }
+    @PreDestroy
+    private void destroy() {
+        log.info("关闭秒杀订单处理线程池");
+        SECKILL_ORDER_EXECUTOR.shutdown();
+        try {
+            // 等待线程池处理完现有任务，最多等10秒
+            if (!SECKILL_ORDER_EXECUTOR.awaitTermination(10, TimeUnit.SECONDS)) {
+                // 强制关闭
+                SECKILL_ORDER_EXECUTOR.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            SECKILL_ORDER_EXECUTOR.shutdownNow();
+        }
     }
 
     private class VoucherOrderHandler implements Runnable {
@@ -89,7 +121,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge("stream.orders", "g1", record.getId());
                 } catch (Exception e) {
                     log.error("处理订单异常", e);
                     handlePendingList();
